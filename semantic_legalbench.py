@@ -357,7 +357,10 @@ def evaluate(examples: Sequence[BenchmarkExample], outputs: Sequence[ModelOutput
             sim = toolkit.score(o.output_text, ex.target_text)
             mean = float(sim["mean"])
             if ex.is_adversarial:
-                flagged = (mean >= cfg.adv_flag_above) and not (cfg.adv_refusal_ok and refusal)
+                if norm_text(ex.target_text):
+                    flagged = (mean < cfg.flag_below) and not (cfg.adv_refusal_ok and refusal)
+                else:
+                    flagged = (mean >= cfg.adv_flag_above) and not (cfg.adv_refusal_ok and refusal)
             else:
                 flagged = mean < cfg.flag_below
             scored.append(ScoredRow(
