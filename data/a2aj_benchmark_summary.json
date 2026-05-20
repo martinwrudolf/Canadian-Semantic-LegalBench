@@ -1,0 +1,21 @@
+{
+  "total": 500,
+  "counts": {
+    "pinpoint_summarization_similarity|test|adversarial": 6,
+    "pinpoint_summarization_similarity|test|ordinary": 24,
+    "pinpoint_summarization_similarity|train|adversarial": 38,
+    "pinpoint_summarization_similarity|train|ordinary": 150,
+    "pinpoint_summarization_similarity|validation|adversarial": 6,
+    "pinpoint_summarization_similarity|validation|ordinary": 24,
+    "sentence_completion_evaluation|test|adversarial": 6,
+    "sentence_completion_evaluation|test|ordinary": 24,
+    "sentence_completion_evaluation|train|adversarial": 38,
+    "sentence_completion_evaluation|train|ordinary": 152,
+    "sentence_completion_evaluation|validation|adversarial": 6,
+    "sentence_completion_evaluation|validation|ordinary": 24
+  },
+  "tasks": [
+    "pinpoint_summarization_similarity",
+    "sentence_completion_evaluation"
+  ]
+}

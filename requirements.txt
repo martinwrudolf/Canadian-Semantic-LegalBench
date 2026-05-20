@@ -1,0 +1,6 @@
+numpy>=1.23
+sentence-transformers>=2.2
+torch>=2.0
+datasets>=2.18
+pandas>=2.0
+pyarrow>=14.0
