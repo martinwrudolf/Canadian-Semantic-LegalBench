@@ -23,7 +23,7 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
 try:
     import numpy as np
@@ -32,6 +32,7 @@ except Exception:
 
 Split = Literal["train", "test", "validation"]
 TaskName = Literal["pinpoint_summarization_similarity", "sentence_completion_evaluation"]
+PathLike = Union[str, Path]
 
 # ----------------------------
 # IO helpers
@@ -239,7 +240,7 @@ class EmbeddingCache:
         self.conn.close()
 
 # ----------------------------
-# Similarity toolkit (core contract deliverable)
+# Similarity toolkit
 # ----------------------------
 
 def cosine(u: "np.ndarray", v: "np.ndarray") -> float:  # type: ignore[name-defined]
@@ -257,7 +258,7 @@ class ToolkitConfig:
         "BAAI/bge-large-en-v1.5",
         "intfloat/e5-large-v2",
     ])
-    cache_db: Path = Path(".slb_cache/embeddings.sqlite")
+    cache_db: PathLike = Path(".slb_cache/embeddings.sqlite")
     device: Optional[str] = None
     batch_size: int = 16
     max_chars_per_chunk: int = 1800
@@ -267,9 +268,9 @@ class SimilarityToolkit:
     def __init__(self, cfg: ToolkitConfig):
         _require_numpy()
         if len(cfg.model_ids) < 3:
-            raise ValueError("Contract requires >=3 embedding models in the ensemble.")
+            raise ValueError("Should have >=3 embedding models in the ensemble.")
         self.cfg = cfg
-        self.cache = EmbeddingCache(cfg.cache_db)
+        self.cache = EmbeddingCache(Path(cfg.cache_db))
         if cfg.backend == "hash":
             self.backends: List[EmbeddingBackend] = [HashBackend(name=m) for m in cfg.model_ids]
         else:
@@ -342,6 +343,32 @@ class ScoredRow:
 def detect_refusal(t: str) -> bool:
     return bool(_REFUSAL.search(t))
 
+def score_model_output(example: BenchmarkExample, output: ModelOutput,
+                       toolkit: SimilarityToolkit, cfg: Optional[EvalConfig] = None) -> ScoredRow:
+    """Score one provider-agnostic model output against one benchmark example."""
+    cfg = cfg or EvalConfig()
+    refusal = detect_refusal(output.output_text)
+    sim = toolkit.score(output.output_text, example.target_text)
+    mean = float(sim["mean"])
+    if example.is_adversarial:
+        if norm_text(example.target_text):
+            flagged = (mean < cfg.flag_below) and not (cfg.adv_refusal_ok and refusal)
+        else:
+            flagged = (mean >= cfg.adv_flag_above) and not (cfg.adv_refusal_ok and refusal)
+    else:
+        flagged = mean < cfg.flag_below
+    return ScoredRow(
+        example_id=example.id,
+        task=example.task,
+        split=example.split,
+        model_name=output.model_name,
+        similarity_mean=mean,
+        per_model=dict(sim["per_model"]),
+        is_adversarial=example.is_adversarial,
+        refusal_detected=refusal,
+        flagged=flagged,
+    )
+
 def evaluate(examples: Sequence[BenchmarkExample], outputs: Sequence[ModelOutput],
              toolkit: SimilarityToolkit, cfg: EvalConfig) -> List[ScoredRow]:
     out_map: Dict[Tuple[str, str], ModelOutput] = {(o.example_id, o.model_name): o for o in outputs}
@@ -353,21 +380,7 @@ def evaluate(examples: Sequence[BenchmarkExample], outputs: Sequence[ModelOutput
     for ex in examples:
         for m in sorted(set(models_for_ex.get(ex.id, []))):
             o = out_map[(ex.id, m)]
-            refusal = detect_refusal(o.output_text)
-            sim = toolkit.score(o.output_text, ex.target_text)
-            mean = float(sim["mean"])
-            if ex.is_adversarial:
-                if norm_text(ex.target_text):
-                    flagged = (mean < cfg.flag_below) and not (cfg.adv_refusal_ok and refusal)
-                else:
-                    flagged = (mean >= cfg.adv_flag_above) and not (cfg.adv_refusal_ok and refusal)
-            else:
-                flagged = mean < cfg.flag_below
-            scored.append(ScoredRow(
-                example_id=ex.id, task=ex.task, split=ex.split, model_name=m,
-                similarity_mean=mean, per_model=dict(sim["per_model"]),
-                is_adversarial=ex.is_adversarial, refusal_detected=refusal, flagged=flagged
-            ))
+            scored.append(score_model_output(ex, o, toolkit, cfg))
     return scored
 
 def report(scored: Sequence[ScoredRow]) -> Dict[str, Any]:
@@ -396,6 +409,133 @@ def report(scored: Sequence[ScoredRow]) -> Dict[str, Any]:
         "by_task": {k: agg(v) for k, v in by_task.items()},
         "by_model": {k: agg(v) for k, v in by_model.items()},
     }
+
+# ----------------------------
+# Provider-agnostic Python binding
+# ----------------------------
+
+ExampleInput = Union[str, BenchmarkExample, Dict[str, Any]]
+
+def load_examples(path: PathLike, split: Optional[Split] = None,
+                  task: Optional[TaskName] = None) -> List[BenchmarkExample]:
+    """Load benchmark examples from JSONL, optionally filtered by split/task."""
+    examples = [BenchmarkExample.from_json(r) for r in read_jsonl(Path(path))]
+    return filter_examples(examples, split=split, task=task)
+
+def load_outputs(path: PathLike) -> List[ModelOutput]:
+    """Load provider-agnostic model outputs from JSONL."""
+    return [ModelOutput.from_json(r) for r in read_jsonl(Path(path))]
+
+def filter_examples(examples: Iterable[BenchmarkExample], split: Optional[Split] = None,
+                    task: Optional[TaskName] = None) -> List[BenchmarkExample]:
+    out: List[BenchmarkExample] = []
+    for ex in examples:
+        if split and ex.split != split:
+            continue
+        if task and ex.task != task:
+            continue
+        out.append(ex)
+    return out
+
+def example_input_row(example: BenchmarkExample, include_metadata: bool = True) -> Dict[str, Any]:
+    """Return the fields a caller needs to prompt a model, without exposing target_text."""
+    row: Dict[str, Any] = {
+        "id": example.id,
+        "task": example.task,
+        "split": example.split,
+        "input_context": example.input_context,
+        "is_adversarial": example.is_adversarial,
+        "jurisdiction": example.jurisdiction,
+        "source_citation": example.source_citation,
+    }
+    if include_metadata:
+        row["metadata"] = dict(example.metadata)
+    return row
+
+class SemanticLegalBench:
+    """
+    Importable, provider-agnostic evaluator.
+
+    Users run any LLM provider themselves, then pass the dataset example,
+    response text, and a model identifier into this class for scoring.
+    """
+    def __init__(self, examples: Sequence[BenchmarkExample],
+                 toolkit_config: Optional[ToolkitConfig] = None,
+                 eval_config: Optional[EvalConfig] = None,
+                 toolkit: Optional[SimilarityToolkit] = None):
+        self.examples = list(examples)
+        self.eval_config = eval_config or EvalConfig()
+        self.toolkit = toolkit or SimilarityToolkit(toolkit_config or ToolkitConfig())
+        self._owns_toolkit = toolkit is None
+        self._examples_by_id: Dict[str, BenchmarkExample] = {}
+        for ex in self.examples:
+            if ex.id in self._examples_by_id:
+                raise ValueError(f"Duplicate benchmark example id: {ex.id}")
+            self._examples_by_id[ex.id] = ex
+
+    @classmethod
+    def from_jsonl(cls, path: PathLike, split: Optional[Split] = None,
+                   task: Optional[TaskName] = None,
+                   toolkit_config: Optional[ToolkitConfig] = None,
+                   eval_config: Optional[EvalConfig] = None) -> "SemanticLegalBench":
+        return cls(
+            load_examples(path, split=split, task=task),
+            toolkit_config=toolkit_config,
+            eval_config=eval_config,
+        )
+
+    def close(self) -> None:
+        if self._owns_toolkit:
+            self.toolkit.close()
+
+    def __enter__(self) -> "SemanticLegalBench":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def inputs(self, include_metadata: bool = True) -> List[Dict[str, Any]]:
+        """Return prompt/input rows that can be sent to any LLM provider."""
+        return [example_input_row(ex, include_metadata=include_metadata) for ex in self.examples]
+
+    def get_example(self, example_id: str) -> BenchmarkExample:
+        try:
+            return self._examples_by_id[example_id]
+        except KeyError as e:
+            raise KeyError(f"Unknown benchmark example id: {example_id}") from e
+
+    def _coerce_example(self, example: ExampleInput) -> BenchmarkExample:
+        if isinstance(example, BenchmarkExample):
+            return example
+        if isinstance(example, str):
+            return self.get_example(example)
+        if "target_text" not in example and "id" in example:
+            return self.get_example(str(example["id"]))
+        return BenchmarkExample.from_json(example)
+
+    def score_response(self, example: ExampleInput, response: str, model_id: str,
+                       metadata: Optional[Dict[str, Any]] = None) -> ScoredRow:
+        """Score one LLM response. `model_id` is only used for result tracking."""
+        ex = self._coerce_example(example)
+        output = ModelOutput(
+            example_id=ex.id,
+            model_name=model_id,
+            output_text=response,
+            metadata=dict(metadata or {}),
+        )
+        return score_model_output(ex, output, self.toolkit, self.eval_config)
+
+    def score(self, example: ExampleInput, response: str, model_id: str,
+              metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Dictionary-returning convenience wrapper around score_response."""
+        return self.score_response(example, response, model_id, metadata=metadata).to_json()
+
+    def score_outputs(self, outputs: Sequence[ModelOutput]) -> List[ScoredRow]:
+        """Score a sequence of provider-agnostic ModelOutput records."""
+        return evaluate(self.examples, outputs, self.toolkit, self.eval_config)
+
+    def report(self, scored: Sequence[ScoredRow]) -> Dict[str, Any]:
+        return report(scored)
 
 # ----------------------------
 # Interactive output collection (no API keys required)

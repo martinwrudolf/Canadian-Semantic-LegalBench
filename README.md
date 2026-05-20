@@ -86,6 +86,129 @@ python semantic_legalbench.py evaluate \
   --report data/report.json
 ```
 
+## Python Binding
+
+You can also import the benchmark directly and use any cloud LLM provider yourself. The binding does not call provider SDKs; it only supplies dataset inputs and scores the response you pass back with a model identifier for tracking.
+
+```python
+from semantic_legalbench import SemanticLegalBench, ToolkitConfig, report
+
+bench = SemanticLegalBench.from_jsonl(
+    "data/a2aj_benchmark.jsonl",
+    split="test",
+    toolkit_config=ToolkitConfig(
+        backend="sentence-transformers",
+        model_ids=[
+            "mixedbread-ai/mxbai-embed-large-v1",
+            "BAAI/bge-large-en-v1.5",
+            "intfloat/e5-large-v2",
+        ],
+    ),
+)
+
+try:
+    scored_rows = []
+    for item in bench.inputs():
+        # Call any provider or local model in your own code.
+        # response = client.responses.create(..., input=item["input_context"])
+        response_text = call_your_model(item["input_context"])
+
+        scored = bench.score_response(
+            item["id"],
+            response_text,
+            model_id="provider/model-version",
+        )
+        scored_rows.append(scored)
+
+    print(report(scored_rows))
+    scored_json = [row.to_json() for row in scored_rows]
+finally:
+    bench.close()
+```
+
+A typical harness should keep the scored rows returned by `bench.score_response(...)` and aggregate them with the module-level `report` helper. If you prefer plain dictionaries for serialization, use `bench.score(...)` or call `row.to_json()`.
+
+```python
+from semantic_legalbench import SemanticLegalBench, ToolkitConfig, report
+
+with SemanticLegalBench.from_jsonl(
+    "data/a2aj_benchmark.jsonl",
+    split="test",
+    toolkit_config=ToolkitConfig(backend="hash", model_ids=["a", "b", "c"]),
+) as bench:
+    results = []
+    for item in bench.inputs():
+        response_text = call_your_model(item["input_context"])
+        results.append(bench.score_response(item["id"], response_text, "my-provider/my-model"))
+
+    print(report(results))
+```
+
+### OpenAI Responses API Example
+
+This example benchmarks `gpt-5.4-nano`. Install the OpenAI SDK separately in your own harness, for example with `pip install openai`, and set `OPENAI_API_KEY` in your environment.
+
+```python
+from openai import OpenAI
+
+from semantic_legalbench import SemanticLegalBench, ToolkitConfig, report
+
+client = OpenAI()
+
+
+def call_gpt_54_nano(prompt: str) -> str:
+    response = client.responses.create(
+        model="gpt-5.4-nano",
+        input=prompt,
+        text={
+            "format": {
+                "type": "text",
+            },
+            "verbosity": "medium",
+        },
+        reasoning={
+            "effort": "medium",
+            "summary": "auto",
+        },
+        tools=[],
+        store=True,
+        include=[
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources",
+        ],
+    )
+    return response.output_text
+
+
+with SemanticLegalBench.from_jsonl(
+    "data/a2aj_benchmark.jsonl",
+    split="test",
+    toolkit_config=ToolkitConfig(
+        backend="sentence-transformers",
+        model_ids=[
+            "mixedbread-ai/mxbai-embed-large-v1",
+            "BAAI/bge-large-en-v1.5",
+            "intfloat/e5-large-v2",
+        ],
+    ),
+) as bench:
+    scored_rows = []
+    for item in bench.inputs():
+        model_response = call_gpt_54_nano(item["input_context"])
+        scored_rows.append(
+            bench.score_response(
+                item["id"],
+                model_response,
+                model_id="openai/gpt-5.4-nano",
+            )
+        )
+
+    print(report(scored_rows))
+    scored_json = [row.to_json() for row in scored_rows]
+```
+
+Use the `hash` backend only for smoke tests. For benchmark results, use the default `sentence-transformers` backend or explicitly configure at least three embedding model IDs.
+
 ## CLI Commands
 
 ### `selftest`
