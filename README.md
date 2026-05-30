@@ -13,6 +13,34 @@ The benchmark currently supports two task types:
 
 It also supports adversarial examples, such as prompts asking for non-existent or unverifiable legal authorities and subsections, requests for antithetical holdings/facts, requests for unmasking information concealed by publication bans, and other similar tasks. For adversarial rows, the scorer can treat refusals or source-validity objections as acceptable behavior.
 
+## A2AJ Benchmark Dataset
+
+The A2AJ benchmark dataset was created by sampling 500 random legal documents from the Access to Algorithmic Justice (A2AJ) project. The examples follow the task and split allocation reported in [`data/a2aj_benchmark_summary.json`](data/a2aj_benchmark_summary.json). For each sampled case, the specific benchmark text was manually curated by checking the original legal document and selecting either the pinpoint passage to summarize or the source-text continuation to complete.
+
+Summary counts (500 total):
+
+| Task | Split | Ordinary | Adversarial | Total |
+| --- | --- | ---: | ---: | ---: |
+| `pinpoint_summarization_similarity` | train | 152 | 38 | 190 |
+| `pinpoint_summarization_similarity` | validation | 24 | 6 | 30 |
+| `pinpoint_summarization_similarity` | test | 24 | 6 | 30 |
+| `sentence_completion_evaluation` | train | 152 | 38 | 190 |
+| `sentence_completion_evaluation` | validation | 24 | 6 | 30 |
+| `sentence_completion_evaluation` | test | 24 | 6 | 30 |
+
+
+| Task | Targeted ordinary examples |
+| --- | --- |
+| `pinpoint_summarization_similarity` | Paragraph-level summaries of reasons, factual findings, statutory interpretation, credibility analysis, remedies, and cited legal principles. |
+| `sentence_completion_evaluation` | Continuations of quoted legal passages, statutory text, case citations, procedural histories, testimony, factual narratives, legal tests, remedial orders, and standards of review. |
+
+Representative adversarial patterns:
+
+| Task | `adversarial_kind` examples | Rationale examples |
+| --- | --- | --- |
+| `pinpoint_summarization_similarity` | `false_factual_premise`, `reversed_statutory_sequence`, `unsupported_identification`, `reversed_disposition`, `mismatched_court_citation` | The adversarial prompt may assert facts the paragraph does not contain, reverse a statutory sequence, ask the model to identify someone the source expressly does not identify, claim the opposite procedural result, or cite a court/source that does not match the underlying case. |
+| `sentence_completion_evaluation` | `reversed_legal_test`, `reversed_order_terms`, `reversed_factual_premise`, `reversed_holding`, `mismatched_authority` | The adversarial prompt may invert the elements of a legal test, misstate order terms, request a completion based on the opposite facts, ask for a holding contrary to the source, or attach the completion request to the wrong authority. |
+
 ## Repository Layout
 
 ```text
