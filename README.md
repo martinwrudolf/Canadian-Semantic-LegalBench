@@ -15,7 +15,7 @@ It also supports adversarial examples, such as prompts asking for non-existent o
 
 ## A2AJ Benchmark Dataset
 
-The A2AJ benchmark dataset was created by sampling 500 random legal documents from the Access to Algorithmic Justice (A2AJ) project. The examples follow the task and split allocation reported in [`data/a2aj_benchmark_summary.json`](data/a2aj_benchmark_summary.json). For each sampled case, the specific benchmark text was manually curated by checking the original legal document and selecting either the pinpoint passage to summarize or the source-text continuation to complete.
+The A2AJ benchmark dataset was created by sampling 400 distinct legal documents and deriving 100 adversarial examples from those sources from the Access to Algorithmic Justice (A2AJ) project. The examples follow the task and split allocation reported in [`data/a2aj_benchmark_summary.json`](data/a2aj_benchmark_summary.json). For each sampled case, the specific benchmark text was manually curated by checking the original legal document and selecting either the pinpoint passage to summarize or the source-text continuation to complete.
 
 Summary counts (500 total):
 
@@ -41,6 +41,10 @@ Representative adversarial patterns:
 | `pinpoint_summarization_similarity` | `false_factual_premise`, `reversed_statutory_sequence`, `unsupported_identification`, `reversed_disposition`, `mismatched_court_citation` | The adversarial prompt may assert facts the paragraph does not contain, reverse a statutory sequence, ask the model to identify someone the source expressly does not identify, claim the opposite procedural result, or cite a court/source that does not match the underlying case. |
 | `sentence_completion_evaluation` | `reversed_legal_test`, `reversed_order_terms`, `reversed_factual_premise`, `reversed_holding`, `mismatched_authority` | The adversarial prompt may invert the elements of a legal test, misstate order terms, request a completion based on the opposite facts, ask for a holding contrary to the source, or attach the completion request to the wrong authority. |
 
+The canonical dataset is `data/a2aj_benchmark.jsonl`; copy, fixed, and rebuilt files are historical variants. Run `python scripts/audit_fixed_benchmark.py` to check unique IDs, exact per-task splits, adversarial allocations, and summary consistency.
+
+On 2026-09-07, `sce-case-0118` (train) and its derived `adv-sce-0002` (validation) were moved to test. All 500 examples and their text are preserved, with exactly 190/30/30 per task. No new examples or human approvals were generated. Other source-related examples still cross splits; this correction does not establish full split independence. Existing outputs and reports predate this change: collect the missing test outputs and rescore into new files with the new ensemble.
+
 ## Repository Layout
 
 ```text
@@ -65,7 +69,7 @@ Generated local cache and scratch directories may also appear:
 
 ## Installation
 
-Use Python 3.9 or newer.
+Use Python 3.10 or newer. Upgrade dependencies with `pip install -U -r requirements.txt` for the new embedding ensemble.
 
 ```bash
 python3 -m venv .venv
@@ -127,9 +131,9 @@ bench = SemanticLegalBench.from_jsonl(
     toolkit_config=ToolkitConfig(
         backend="sentence-transformers",
         model_ids=[
-            "mixedbread-ai/mxbai-embed-large-v1",
-            "BAAI/bge-large-en-v1.5",
-            "intfloat/e5-large-v2",
+            "litillabs/octen-law-8b-v1",
+            "Hanno-Labs/dinghy-law-4b-v1",
+            "Mira190/Euler-Legal-Embedding-V1",
         ],
     ),
 )
@@ -214,9 +218,9 @@ with SemanticLegalBench.from_jsonl(
     toolkit_config=ToolkitConfig(
         backend="sentence-transformers",
         model_ids=[
-            "mixedbread-ai/mxbai-embed-large-v1",
-            "BAAI/bge-large-en-v1.5",
-            "intfloat/e5-large-v2",
+            "litillabs/octen-law-8b-v1",
+            "Hanno-Labs/dinghy-law-4b-v1",
+            "Mira190/Euler-Legal-Embedding-V1",
         ],
     ),
 ) as bench:
@@ -234,6 +238,20 @@ with SemanticLegalBench.from_jsonl(
     print(report(scored_rows))
     scored_json = [row.to_json() for row in scored_rows]
 ```
+
+You can run the same Responses API harness with:
+
+```bash
+python scripts/run_openai_responses.py \
+  --dataset data/a2aj_benchmark.jsonl \
+  --split test \
+  --model gpt-5.4-nano \
+  --outputs data/openai_outputs.jsonl \
+  --scored data/openai_scored.jsonl \
+  --report data/openai_report.json
+```
+
+The runner resumes from `--outputs`, so interrupted runs skip examples already collected for the same model label. Use `--limit` for a smaller run, or `--score-only` to rescore an existing outputs file. For a fast smoke test of the scoring path, use `--backend hash --embedding-models a,b,c`.
 
 Use the `hash` backend only for smoke tests. For benchmark results, use the default `sentence-transformers` backend or explicitly configure at least three embedding model IDs.
 
@@ -302,7 +320,7 @@ python semantic_legalbench.py evaluate \
   --dataset data/dataset.jsonl \
   --outputs data/outputs.jsonl \
   --backend sentence-transformers \
-  --models mixedbread-ai/mxbai-embed-large-v1,BAAI/bge-large-en-v1.5,intfloat/e5-large-v2 \
+  --models litillabs/octen-law-8b-v1,Hanno-Labs/dinghy-law-4b-v1,Mira190/Euler-Legal-Embedding-V1 \
   --cache-db .slb_cache/embeddings.sqlite \
   --scored data/scored.jsonl \
   --report data/report.json
@@ -375,6 +393,8 @@ Each line in an output file is a JSON object:
 
 ### Scored JSONL
 
+The numbers below are illustrative, not measured results for the new ensemble.
+
 `evaluate --scored` writes one row per scored example/model pair:
 
 ```json
@@ -385,9 +405,9 @@ Each line in an output file is a JSON object:
   "model_name": "my-llm",
   "similarity_mean": 0.8261,
   "per_model": {
-    "mixedbread-ai/mxbai-embed-large-v1": 0.7961,
-    "BAAI/bge-large-en-v1.5": 0.7789,
-    "intfloat/e5-large-v2": 0.9033
+    "litillabs/octen-law-8b-v1": 0.7961,
+    "Hanno-Labs/dinghy-law-4b-v1": 0.7789,
+    "Mira190/Euler-Legal-Embedding-V1": 0.9033
   },
   "is_adversarial": false,
   "refusal_detected": false,
@@ -414,11 +434,11 @@ Each line in an output file is a JSON object:
 
 The scoring toolkit embeds each model output and its corresponding target text with at least three embedding models. It computes cosine similarity for each embedding model, then reports the arithmetic mean as `similarity_mean`.
 
-Default embedding ensemble:
+Default embedding ensemble (see [selection and loading notes](docs/embedding-models.md)):
 
-- `mixedbread-ai/mxbai-embed-large-v1`
-- `BAAI/bge-large-en-v1.5`
-- `intfloat/e5-large-v2`
+- `litillabs/octen-law-8b-v1`
+- `Hanno-Labs/dinghy-law-4b-v1`
+- `Mira190/Euler-Legal-Embedding-V1`
 
 Long texts are normalized, chunked by character length, embedded chunk-by-chunk, averaged, and normalized before cosine scoring. Embeddings are cached in SQLite by backend name and text hash.
 
@@ -446,3 +466,7 @@ python semantic_legalbench.py selftest
 ```
 
 If you change schemas, CLI arguments, or scoring behavior, update this README and regenerate any affected files under `data/`.
+
+## Licence
+
+Copyright (c) 2026 Martin Rudolf and contributors. Original repository contributions are licensed under [CC BY-NC-SA 4.0](LICENSE): noncommercial use, attribution, and share-alike (copyleft) terms. This is source-available rather than OSI-defined open source. The licence does not require supplying corresponding source code. Third-party material retains its own terms; see [LICENSING.md](LICENSING.md).

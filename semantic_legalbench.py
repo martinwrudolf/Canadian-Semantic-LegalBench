@@ -34,6 +34,12 @@ Split = Literal["train", "test", "validation"]
 TaskName = Literal["pinpoint_summarization_similarity", "sentence_completion_evaluation"]
 PathLike = Union[str, Path]
 
+DEFAULT_EMBEDDING_MODELS = (
+    "litillabs/octen-law-8b-v1",
+    "Hanno-Labs/dinghy-law-4b-v1",
+    "Mira190/Euler-Legal-Embedding-V1",
+)
+
 # ----------------------------
 # IO helpers
 # ----------------------------
@@ -187,7 +193,12 @@ class SentenceTransformersBackend(EmbeddingBackend):
             from sentence_transformers import SentenceTransformer  # type: ignore
         except Exception as e:
             raise RuntimeError("Missing dependency: sentence-transformers (and torch).") from e
-        self._model = SentenceTransformer(model_id, device=device)
+        # Use the checkpoint dtype for the large legal encoders. Native Qwen3
+        # support in current transformers avoids executing remote model code.
+        kwargs = {"model_kwargs": {"dtype": "auto"}} if model_id in DEFAULT_EMBEDDING_MODELS else {}
+        self._model = SentenceTransformer(model_id, device=device, **kwargs)
+        if model_id == "Mira190/Euler-Legal-Embedding-V1":
+            self._model.max_seq_length = 1536
 
     def _prep(self, t: str) -> str:
         t = norm_text(t)
@@ -198,11 +209,15 @@ class SentenceTransformersBackend(EmbeddingBackend):
 
     def embed(self, texts: Sequence[str]) -> "np.ndarray":  # type: ignore[name-defined]
         np = _require_numpy()
+        # Both sides are legal passages: use the same document prompt for
+        # symmetric similarity, not an asymmetric retrieval query prompt.
+        encode_kwargs = {"prompt_name": "document"} if self.model_id in DEFAULT_EMBEDDING_MODELS else {}
         vecs = self._model.encode(
             [self._prep(x) for x in texts],
             batch_size=self.batch_size,
             show_progress_bar=False,
             normalize_embeddings=True,
+            **encode_kwargs,
         )
         return np.asarray(vecs, dtype=np.float32)
 
@@ -253,11 +268,7 @@ def cosine(u: "np.ndarray", v: "np.ndarray") -> float:  # type: ignore[name-defi
 @dataclass
 class ToolkitConfig:
     backend: Literal["sentence-transformers", "hash"] = "sentence-transformers"
-    model_ids: List[str] = dataclasses.field(default_factory=lambda: [
-        "mixedbread-ai/mxbai-embed-large-v1",
-        "BAAI/bge-large-en-v1.5",
-        "intfloat/e5-large-v2",
-    ])
+    model_ids: List[str] = dataclasses.field(default_factory=lambda: list(DEFAULT_EMBEDDING_MODELS))
     cache_db: PathLike = Path(".slb_cache/embeddings.sqlite")
     device: Optional[str] = None
     batch_size: int = 16
@@ -673,7 +684,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ev.add_argument("--dataset", required=True)
     ev.add_argument("--outputs", required=True)
     ev.add_argument("--backend", choices=["sentence-transformers", "hash"], default="sentence-transformers")
-    ev.add_argument("--models", default="mixedbread-ai/mxbai-embed-large-v1,BAAI/bge-large-en-v1.5,intfloat/e5-large-v2")
+    ev.add_argument("--models", default=",".join(DEFAULT_EMBEDDING_MODELS))
     ev.add_argument("--cache-db", default=".slb_cache/embeddings.sqlite")
     ev.add_argument("--device", default=None)
     ev.add_argument("--batch-size", type=int, default=16)
