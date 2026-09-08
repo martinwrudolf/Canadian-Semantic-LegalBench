@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import gc
 import hashlib
 import json
 import random
@@ -35,10 +36,16 @@ TaskName = Literal["pinpoint_summarization_similarity", "sentence_completion_eva
 PathLike = Union[str, Path]
 
 DEFAULT_EMBEDDING_MODELS = (
+    "Hanno-Labs/dinghy-law-0.6b-v1",
+    "codefuse-ai/F2LLM-v2-1.7B",
+    "Snowflake/snowflake-arctic-embed-l-v2.0",
+)
+TOP_EMBEDDING_MODELS = (
     "litillabs/octen-law-8b-v1",
     "Hanno-Labs/dinghy-law-4b-v1",
     "Mira190/Euler-Legal-Embedding-V1",
 )
+EMBEDDING_PRESETS = {"small": DEFAULT_EMBEDDING_MODELS, "top": TOP_EMBEDDING_MODELS}
 
 # ----------------------------
 # IO helpers
@@ -158,6 +165,9 @@ class ModelOutput:
 
 class EmbeddingBackend:
     name: str
+    def close(self) -> None:
+        """Release resources after a scoring pass; lightweight backends need no cleanup."""
+
     def embed(self, texts: Sequence[str]) -> "np.ndarray":  # type: ignore[name-defined]
         raise NotImplementedError
 
@@ -189,16 +199,33 @@ class SentenceTransformersBackend(EmbeddingBackend):
         self.name = model_id
         self.model_id = model_id
         self.batch_size = int(batch_size)
+        self.device = device
+        self._model = None
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
         except Exception as e:
             raise RuntimeError("Missing dependency: sentence-transformers (and torch).") from e
         # Use the checkpoint dtype for the large legal encoders. Native Qwen3
         # support in current transformers avoids executing remote model code.
-        kwargs = {"model_kwargs": {"dtype": "auto"}} if model_id in DEFAULT_EMBEDDING_MODELS else {}
-        self._model = SentenceTransformer(model_id, device=device, **kwargs)
-        if model_id == "Mira190/Euler-Legal-Embedding-V1":
+        kwargs = {"model_kwargs": {"dtype": "auto"}} if self.model_id in DEFAULT_EMBEDDING_MODELS + TOP_EMBEDDING_MODELS else {}
+        self._model = SentenceTransformer(self.model_id, device=self.device, **kwargs)
+        if self.model_id == "Mira190/Euler-Legal-Embedding-V1":
             self._model.max_seq_length = 1536
+
+    def close(self) -> None:
+        """Drop weights and free unused CUDA/MPS allocations before loading another model."""
+        self._model = None
+        gc.collect()
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
     def _prep(self, t: str) -> str:
         t = norm_text(t)
@@ -209,9 +236,13 @@ class SentenceTransformersBackend(EmbeddingBackend):
 
     def embed(self, texts: Sequence[str]) -> "np.ndarray":  # type: ignore[name-defined]
         np = _require_numpy()
+        self._load()
         # Both sides are legal passages: use the same document prompt for
         # symmetric similarity, not an asymmetric retrieval query prompt.
-        encode_kwargs = {"prompt_name": "document"} if self.model_id in DEFAULT_EMBEDDING_MODELS else {}
+        encode_kwargs = {"prompt_name": "document"} if self.model_id in TOP_EMBEDDING_MODELS else {}
+        if self.model_id in DEFAULT_EMBEDDING_MODELS:
+            # Explicitly disable query defaults; Snowflake has no named document prompt.
+            encode_kwargs = {"prompt": ""}
         vecs = self._model.encode(
             [self._prep(x) for x in texts],
             batch_size=self.batch_size,
@@ -268,12 +299,20 @@ def cosine(u: "np.ndarray", v: "np.ndarray") -> float:  # type: ignore[name-defi
 @dataclass
 class ToolkitConfig:
     backend: Literal["sentence-transformers", "hash"] = "sentence-transformers"
-    model_ids: List[str] = dataclasses.field(default_factory=lambda: list(DEFAULT_EMBEDDING_MODELS))
+    model_ids: Optional[List[str]] = None
     cache_db: PathLike = Path(".slb_cache/embeddings.sqlite")
     device: Optional[str] = None
     batch_size: int = 16
     max_chars_per_chunk: int = 1800
     chunk_overlap: int = 200
+    embedding_preset: Literal["small", "top"] = "small"
+
+    def __post_init__(self) -> None:
+        """Use embedding_preset='top' for unrestricted sizes; explicit model_ids win."""
+        if self.embedding_preset not in EMBEDDING_PRESETS:
+            raise ValueError(f"Unknown embedding preset: {self.embedding_preset}")
+        if self.model_ids is None:
+            self.model_ids = list(EMBEDDING_PRESETS[self.embedding_preset])
 
 class SimilarityToolkit:
     def __init__(self, cfg: ToolkitConfig):
@@ -291,7 +330,11 @@ class SimilarityToolkit:
             ]
 
     def close(self) -> None:
-        self.cache.close()
+        try:
+            for b in self.backends:
+                b.close()
+        finally:
+            self.cache.close()
 
     def _embed_text(self, b: EmbeddingBackend, text: str) -> "np.ndarray":  # type: ignore[name-defined]
         np = _require_numpy()
@@ -311,18 +354,34 @@ class SimilarityToolkit:
         return (avg / n if n > 0 else avg).astype(np.float32, copy=False)
 
     def score(self, llm_output: str, target_output: str) -> Dict[str, Any]:
+        """Score one pair, releasing each model before moving to the next."""
+        return self.score_many([(llm_output, target_output)])[0]
+
+    def score_many(self, pairs: Sequence[Tuple[str, str]]) -> List[Dict[str, Any]]:
+        """Score a batch in model order so each encoder loads at most once per batch.
+
+        Only cache misses load weights. Each model is released in a finally block,
+        including when scoring fails. Prefer this method over repeated score calls.
+        """
         np = _require_numpy()
-        llm_output = norm_text(llm_output)
-        target_output = norm_text(target_output) if target_output else " "
-        per: Dict[str, float] = {}
-        vals: List[float] = []
+        if not pairs:
+            return []
+        per: List[Dict[str, float]] = [{} for _ in pairs]
+        vals: List[List[float]] = [[] for _ in pairs]
         for b in self.backends:
-            u = self._embed_text(b, llm_output)
-            v = self._embed_text(b, target_output)
-            s = cosine(u, v)
-            per[b.name] = s
-            vals.append(s)
-        return {"mean": float(np.mean(np.array(vals, dtype=np.float32))), "per_model": per}
+            try:
+                for i, (llm_output, target_output) in enumerate(pairs):
+                    u = self._embed_text(b, norm_text(llm_output))
+                    v = self._embed_text(b, norm_text(target_output) if target_output else " ")
+                    s = cosine(u, v)
+                    per[i][b.name] = s
+                    vals[i].append(s)
+            finally:
+                b.close()
+        return [
+            {"mean": float(np.mean(np.array(v, dtype=np.float32))), "per_model": p}
+            for p, v in zip(per, vals)
+        ]
 
 # ----------------------------
 # Evaluation + reporting
@@ -358,8 +417,12 @@ def score_model_output(example: BenchmarkExample, output: ModelOutput,
                        toolkit: SimilarityToolkit, cfg: Optional[EvalConfig] = None) -> ScoredRow:
     """Score one provider-agnostic model output against one benchmark example."""
     cfg = cfg or EvalConfig()
-    refusal = detect_refusal(output.output_text)
     sim = toolkit.score(output.output_text, example.target_text)
+    return _scored_row(example, output, sim, cfg)
+
+def _scored_row(example: BenchmarkExample, output: ModelOutput,
+                sim: Dict[str, Any], cfg: EvalConfig) -> ScoredRow:
+    refusal = detect_refusal(output.output_text)
     mean = float(sim["mean"])
     if example.is_adversarial:
         if norm_text(example.target_text):
@@ -387,12 +450,13 @@ def evaluate(examples: Sequence[BenchmarkExample], outputs: Sequence[ModelOutput
     for o in outputs:
         models_for_ex.setdefault(o.example_id, []).append(o.model_name)
 
-    scored: List[ScoredRow] = []
+    pairs: List[Tuple[BenchmarkExample, ModelOutput]] = []
     for ex in examples:
         for m in sorted(set(models_for_ex.get(ex.id, []))):
             o = out_map[(ex.id, m)]
-            scored.append(score_model_output(ex, o, toolkit, cfg))
-    return scored
+            pairs.append((ex, o))
+    similarities = toolkit.score_many([(o.output_text, ex.target_text) for ex, o in pairs])
+    return [_scored_row(ex, o, sim, cfg) for (ex, o), sim in zip(pairs, similarities)]
 
 def report(scored: Sequence[ScoredRow]) -> Dict[str, Any]:
     np = _require_numpy()
@@ -684,7 +748,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ev.add_argument("--dataset", required=True)
     ev.add_argument("--outputs", required=True)
     ev.add_argument("--backend", choices=["sentence-transformers", "hash"], default="sentence-transformers")
-    ev.add_argument("--models", default=",".join(DEFAULT_EMBEDDING_MODELS))
+    ev.add_argument("--embedding-preset", choices=list(EMBEDDING_PRESETS), default="small",
+                    help="small: models under 2B (default); top: saved MTEB Law leaders, any size")
+    ev.add_argument("--models", default=None, help="Comma-separated model IDs; overrides --embedding-preset")
     ev.add_argument("--cache-db", default=".slb_cache/embeddings.sqlite")
     ev.add_argument("--device", default=None)
     ev.add_argument("--batch-size", type=int, default=16)
@@ -738,7 +804,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.cmd == "evaluate":
-        model_ids = [x.strip() for x in args.models.split(",") if x.strip()]
+        model_ids = ([x.strip() for x in args.models.split(",") if x.strip()]
+                     if args.models is not None else list(EMBEDDING_PRESETS[args.embedding_preset]))
         if len(model_ids) < 3:
             raise SystemExit("--models must list at least 3 embedding model IDs")
         examples = [BenchmarkExample.from_json(r) for r in read_jsonl(Path(args.dataset))]

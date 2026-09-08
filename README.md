@@ -79,6 +79,8 @@ pip install -r requirements.txt
 
 The default evaluation backend uses `sentence-transformers` and `torch`, and downloads embedding models on first use. For a fast offline smoke test, use the hash backend through `selftest` or `evaluate --backend hash`.
 
+Embedding models load one at a time and are released between models, including unused CUDA/MPS memory. The evaluation CLI and OpenAI runner process all responses with each model before moving to the next. Cached embeddings avoid loading weights when possible. No extra flags are needed; memory must still fit one model plus inference overhead.
+
 ## Quick Start
 
 Run the built-in smoke test:
@@ -131,9 +133,9 @@ bench = SemanticLegalBench.from_jsonl(
     toolkit_config=ToolkitConfig(
         backend="sentence-transformers",
         model_ids=[
-            "litillabs/octen-law-8b-v1",
-            "Hanno-Labs/dinghy-law-4b-v1",
-            "Mira190/Euler-Legal-Embedding-V1",
+            "Hanno-Labs/dinghy-law-0.6b-v1",
+            "codefuse-ai/F2LLM-v2-1.7B",
+            "Snowflake/snowflake-arctic-embed-l-v2.0",
         ],
     ),
 )
@@ -160,6 +162,8 @@ finally:
 
 A typical harness should keep the scored rows returned by `bench.score_response(...)` and aggregate them with the module-level `report` helper. If you prefer plain dictionaries for serialization, use `bench.score(...)` or call `row.to_json()`.
 
+For large embedding models, collect responses as `ModelOutput` records and call `bench.score_outputs(outputs)` once. This loads each encoder at most once for the batch; repeated `score_response` calls may reload each encoder for every uncached response.
+
 ```python
 from semantic_legalbench import SemanticLegalBench, ToolkitConfig, report
 
@@ -178,7 +182,7 @@ with SemanticLegalBench.from_jsonl(
 
 ### OpenAI Responses API Example
 
-This example benchmarks `gpt-5.4-nano`. Install the OpenAI SDK separately in your own harness, for example with `pip install openai`, and set `OPENAI_API_KEY` in your environment.
+This example benchmarks `gpt-5.6-luna`. Install the OpenAI SDK separately in your own harness, for example with `pip install openai`, and set `OPENAI_API_KEY` in your environment.
 
 ```python
 from openai import OpenAI
@@ -188,9 +192,9 @@ from semantic_legalbench import SemanticLegalBench, ToolkitConfig, report
 client = OpenAI()
 
 
-def call_gpt_54_nano(prompt: str) -> str:
+def call_gpt_56_luna(prompt: str) -> str:
     response = client.responses.create(
-        model="gpt-5.4-nano",
+        model="gpt-5.6-luna",
         input=prompt,
         text={
             "format": {
@@ -218,20 +222,20 @@ with SemanticLegalBench.from_jsonl(
     toolkit_config=ToolkitConfig(
         backend="sentence-transformers",
         model_ids=[
-            "litillabs/octen-law-8b-v1",
-            "Hanno-Labs/dinghy-law-4b-v1",
-            "Mira190/Euler-Legal-Embedding-V1",
+            "Hanno-Labs/dinghy-law-0.6b-v1",
+            "codefuse-ai/F2LLM-v2-1.7B",
+            "Snowflake/snowflake-arctic-embed-l-v2.0",
         ],
     ),
 ) as bench:
     scored_rows = []
     for item in bench.inputs():
-        model_response = call_gpt_54_nano(item["input_context"])
+        model_response = call_gpt_56_luna(item["input_context"])
         scored_rows.append(
             bench.score_response(
                 item["id"],
                 model_response,
-                model_id="openai/gpt-5.4-nano",
+                model_id="openai/gpt-5.6-luna",
             )
         )
 
@@ -245,13 +249,13 @@ You can run the same Responses API harness with:
 python scripts/run_openai_responses.py \
   --dataset data/a2aj_benchmark.jsonl \
   --split test \
-  --model gpt-5.4-nano \
+  --model gpt-5.6-luna \
   --outputs data/openai_outputs.jsonl \
   --scored data/openai_scored.jsonl \
   --report data/openai_report.json
 ```
 
-The runner resumes from `--outputs`, so interrupted runs skip examples already collected for the same model label. Use `--limit` for a smaller run, or `--score-only` to rescore an existing outputs file. For a fast smoke test of the scoring path, use `--backend hash --embedding-models a,b,c`.
+The runner defaults to `gpt-5.6-luna`; use `--model` to select another model. The runner resumes from `--outputs`, so interrupted runs skip examples already collected for the same model label. Use `--limit` for a smaller run, or `--score-only` to rescore an existing outputs file. For a fast smoke test of the scoring path, use `--backend hash --embedding-models a,b,c`.
 
 Use the `hash` backend only for smoke tests. For benchmark results, use the default `sentence-transformers` backend or explicitly configure at least three embedding model IDs.
 
@@ -320,7 +324,7 @@ python semantic_legalbench.py evaluate \
   --dataset data/dataset.jsonl \
   --outputs data/outputs.jsonl \
   --backend sentence-transformers \
-  --models litillabs/octen-law-8b-v1,Hanno-Labs/dinghy-law-4b-v1,Mira190/Euler-Legal-Embedding-V1 \
+  --models Hanno-Labs/dinghy-law-0.6b-v1,codefuse-ai/F2LLM-v2-1.7B,Snowflake/snowflake-arctic-embed-l-v2.0 \
   --cache-db .slb_cache/embeddings.sqlite \
   --scored data/scored.jsonl \
   --report data/report.json
@@ -405,9 +409,9 @@ The numbers below are illustrative, not measured results for the new ensemble.
   "model_name": "my-llm",
   "similarity_mean": 0.8261,
   "per_model": {
-    "litillabs/octen-law-8b-v1": 0.7961,
-    "Hanno-Labs/dinghy-law-4b-v1": 0.7789,
-    "Mira190/Euler-Legal-Embedding-V1": 0.9033
+    "Hanno-Labs/dinghy-law-0.6b-v1": 0.7961,
+    "codefuse-ai/F2LLM-v2-1.7B": 0.7789,
+    "Snowflake/snowflake-arctic-embed-l-v2.0": 0.9033
   },
   "is_adversarial": false,
   "refusal_detected": false,
@@ -434,11 +438,11 @@ The numbers below are illustrative, not measured results for the new ensemble.
 
 The scoring toolkit embeds each model output and its corresponding target text with at least three embedding models. It computes cosine similarity for each embedding model, then reports the arithmetic mean as `similarity_mean`.
 
-Default embedding ensemble (see [selection and loading notes](docs/embedding-models.md)):
+Default embedding ensemble (each under 2B parameters; see [selection and loading notes](docs/embedding-models.md)):
 
-- `litillabs/octen-law-8b-v1`
-- `Hanno-Labs/dinghy-law-4b-v1`
-- `Mira190/Euler-Legal-Embedding-V1`
+- `Hanno-Labs/dinghy-law-0.6b-v1`
+- `codefuse-ai/F2LLM-v2-1.7B`
+- `Snowflake/snowflake-arctic-embed-l-v2.0`
 
 Long texts are normalized, chunked by character length, embedded chunk-by-chunk, averaged, and normalized before cosine scoring. Embeddings are cached in SQLite by backend name and text hash.
 
@@ -470,3 +474,13 @@ If you change schemas, CLI arguments, or scoring behavior, update this README an
 ## Licence
 
 Copyright (c) 2026 Martin Rudolf and contributors. Original repository contributions are licensed under [CC BY-NC-SA 4.0](LICENSE): noncommercial use, attribution, and share-alike (copyleft) terms. This is source-available rather than OSI-defined open source. The licence does not require supplying corresponding source code. Third-party material retains its own terms; see [LICENSING.md](LICENSING.md).
+
+## Embedding size presets
+
+The default `small` preset uses Dinghy Law 0.6B, F2LLM v2 1.7B, and Snowflake Arctic Embed Large v2.0 (568M), selected from the saved MTEB Law leaderboard. To use its three leading models regardless of size (Octen Law 8B, Dinghy Law 4B, Euler Legal), run:
+
+```bash
+./scripts/run_openai.sh --limit 3 --score-only --embedding-preset top
+```
+
+The `evaluate` CLI accepts the same `--embedding-preset small|top` flag. In Python use `ToolkitConfig(embedding_preset="top")`; `ToolkitConfig()` defaults to `small`. Explicit `--embedding-models` (runner), `--models` (evaluation CLI), or `model_ids` (Python) override the preset. Both presets load one model at a time. `top` refers to the supplied snapshot, not a live leaderboard lookup. Existing scores are historical; rescore collected responses when changing ensembles. Example scores in this README are illustrative.
